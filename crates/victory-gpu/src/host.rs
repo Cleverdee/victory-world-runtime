@@ -6502,6 +6502,33 @@ unsafe impl Send for ComposePass {}
 // SAFETY: as above.
 unsafe impl Sync for ComposePass {}
 
+/// Creates a root signature independently of the shader compiler.
+///
+/// # Safety
+/// Any pointers in `params` must remain valid through serialization.
+pub(crate) unsafe fn root_signature_from_params(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+) -> windows::core::Result<ID3D12RootSignature> {
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: samplers.len() as u32,
+        pStaticSamplers: samplers.as_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: `params` and the data it references live through serialization.
+    unsafe {
+        let mut blob = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
 fn compose_pass() -> Option<&'static ComposePass> {
     static PASS: OnceLock<Option<ComposePass>> = OnceLock::new();
     PASS.get_or_init(|| {
@@ -6552,21 +6579,7 @@ fn compose_pass() -> Option<&'static ComposePass> {
             };
             // SAFETY: the range and root signature inputs live through serialization.
             unsafe {
-                let desc = D3D12_ROOT_SIGNATURE_DESC {
-                    NumParameters: params.len() as u32,
-                    pParameters: params.as_ptr(),
-                    NumStaticSamplers: 1,
-                    pStaticSamplers: &sampler,
-                    ..Default::default()
-                };
-                let mut blob = None;
-                D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
-                let blob = blob.ok_or_else(windows::core::Error::empty)?;
-                let bytes = std::slice::from_raw_parts(
-                    blob.GetBufferPointer().cast::<u8>(),
-                    blob.GetBufferSize(),
-                );
-                let root = host.device.CreateRootSignature(0, bytes)?;
+                let root = root_signature_from_params(&host.device, &params, &[sampler])?;
                 let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
                     NumDescriptors: COMPOSE_VIEWS,
