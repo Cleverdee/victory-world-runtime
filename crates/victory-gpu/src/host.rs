@@ -6465,7 +6465,6 @@ type Seen = ();
 /// The pass that composes present planes: a triangle over the placement,
 /// the plane's source rectangle sampled bilinearly.
 const COMPOSE: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants = 4, b0, visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2D<float4> plane : register(t0);
 SamplerState clamped : register(s0);
 cbuffer Source : register(b0) { float4 source; };
@@ -6476,7 +6475,6 @@ Corner corner(uint i : SV_VertexID) {
     c.p = float4(c.t.x * 2.0 - 1.0, 1.0 - c.t.y * 2.0, 0.0, 1.0);
     return c;
 }
-[RootSignature(RS)]
 float4 compose(Corner c) : SV_Target {
     return plane.SampleLevel(clamped, lerp(source.xy, source.zw, c.t), 0);
 }
@@ -6504,6 +6502,33 @@ unsafe impl Send for ComposePass {}
 // SAFETY: as above.
 unsafe impl Sync for ComposePass {}
 
+/// Creates a root signature independently of the shader compiler.
+///
+/// # Safety
+/// Any pointers in `params` must remain valid through serialization.
+pub(crate) unsafe fn root_signature_from_params(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+) -> windows::core::Result<ID3D12RootSignature> {
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: samplers.len() as u32,
+        pStaticSamplers: samplers.as_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: `params` and the data it references live through serialization.
+    unsafe {
+        let mut blob = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
 fn compose_pass() -> Option<&'static ComposePass> {
     static PASS: OnceLock<Option<ComposePass>> = OnceLock::new();
     PASS.get_or_init(|| {
@@ -6513,10 +6538,48 @@ fn compose_pass() -> Option<&'static ComposePass> {
             let vs = compile(COMPOSE, s!("corner"), s!("vs_5_1"))?;
             let ps = compile(COMPOSE, s!("compose"), s!("ps_5_1"))?;
             let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            // SAFETY: the root signature is inside the pixel shader; plain
-            // heap creation and queries.
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                ..Default::default()
+            };
+            let params = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &range,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            Num32BitValues: 4,
+                            ..Default::default()
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                },
+            ];
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ..Default::default()
+            };
+            // SAFETY: the range and root signature inputs live through serialization.
             unsafe {
-                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &ps[..])?;
+                let root = root_signature_from_params(&host.device, &params, &[sampler])?;
                 let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
                     NumDescriptors: COMPOSE_VIEWS,
@@ -6773,6 +6836,15 @@ fn record_compose(
 #[cfg(test)]
 mod compose_tests {
     use super::*;
+
+    #[test]
+    fn composes_planes_on_the_host_device() {
+        let Some(host) = host() else { return };
+        let pass = compose_pass().expect("a root signature for the plane shaders");
+        for blend in [0, 1, 2] {
+            assert!(pass.pipeline(&host.device, DXGI_FORMAT_R8G8B8A8_UNORM, blend).is_some());
+        }
+    }
 
     #[test]
     fn rectangles_outside_are_the_whole_surface() {
